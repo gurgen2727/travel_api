@@ -171,6 +171,17 @@ EXAMPLES
       --filter-return-days-time Sat Sun Mon \
       --sort-by price
 
+7️⃣  One‑way trip (no return flight)
+    python flight_search.py --from LHR LGW --to EVN \
+      --depart 2025-07-01 --one-way \
+      --sort-by price
+
+8️⃣   Flexible return to different airport
+    python flight_search.py --from LHR LGW --to EVN TBS \
+      --depart-start 2025-07-01 --depart-end 2025-07-10 \
+      --max-stay 3-4 --allow-different-return-airport \
+      --sort-by price
+
 """
     )
     # core
@@ -206,6 +217,8 @@ EXAMPLES
     p.add_argument("--nonstop", action="store_true")
     p.add_argument("--max-stops", type=int, default=1)
     p.add_argument("--max-results", type=int, default=5)
+    p.add_argument("--one-way", action="store_true", help="Skip return flight and show outbound only")
+    p.add_argument("--allow-different-return-airport", action="store_true", help="Allow inbound to land at different airport")
     p.add_argument("--sort-by", nargs="+",
                    choices=["price", "duration", "departure_date", "return_date"],
                    help="Default: price departure_date duration return_date")
@@ -239,8 +252,8 @@ def expand_stay_durations(tokens: list[str | int]) -> list[int]:
     return sorted(nights)
 
 
-def make_date_pairs() -> list[tuple[str, str]]:
-    pairs: list[tuple[str, str]] = []
+def make_date_pairs() -> list[tuple[str, str | None]]:
+    pairs: list[tuple[str, str | None]] = []
     if ARGS.max_stay:
         ARGS.max_stay = expand_stay_durations(ARGS.max_stay)
 
@@ -266,6 +279,8 @@ def make_date_pairs() -> list[tuple[str, str]]:
             start += timedelta(days=1)
     elif ARGS.depart and ARGS.ret:
         pairs.append((ARGS.depart, ARGS.ret))
+    elif ARGS.depart and ARGS.one_way:
+        pairs.append((ARGS.depart, None))
     else:
         sys.exit("‼️  Provide either fixed dates or a flexible range.")
     return pairs
@@ -321,10 +336,10 @@ def run_search():
                 # Check if departure/return pass the day-time filters before making request
                 if not depart_ok(d_date + "T12:00:00"):
                     continue
-                if not return_ok(r_date + "T12:00:00"):
+                if not ARGS.one_way and not return_ok(r_date + "T12:00:00"):
                     continue
 
-                print(f"{Fore.BLUE}Checking {orig} → {dest} | {d_date} → {r_date}...{Style.RESET_ALL}")
+                print(f"{Fore.BLUE}Checking {orig} → {dest} | {d_date}" + (f" → {r_date}" if not ARGS.one_way else "") + f"...{Style.RESET_ALL}")
                 offers = call_amadeus(token, orig, dest, d_date, r_date)
                 if not offers:
                     continue
@@ -350,12 +365,14 @@ def call_amadeus(token: str, origin: str, destination: str,
         "originLocationCode":      origin,
         "destinationLocationCode": destination,
         "departureDate":           depart,
-        "returnDate":              ret,
         "adults":                  1,
         "max":                     ARGS.max_results,
         "currencyCode":            "GBP",
         "nonStop":                 "true" if ARGS.nonstop else "false",
     }
+    if ret:
+        params["returnDate"] = ret
+
     # Retry logic for rate limit
     for attempt in range(3):
         rsp = requests.get(base_url, headers=headers, params=params)
@@ -388,15 +405,27 @@ def display_offers(offers) -> None:
             continue
 
         # --- Inbound checks ----------------------------------------------------
-        ret_seg = from_itin["segments"][0]
-        if not return_ok(ret_seg["departure"]["at"]):
-            continue
+        if not ARGS.one_way:
+            # -- Return itinerary (pretty print)
+            ret_segs = from_itin["segments"]
+            ret_dep_seg = ret_segs[0]
+            ret_arr_seg = ret_segs[-1]
+            if not ARGS.allow_different_return_airport:
+                to_arr = to_itin["segments"][-1]["arrival"]["iataCode"]
+                from_arr = ret_arr_seg["arrival"]["iataCode"]
+                if to_arr != from_arr:
+                    continue
+
+            ret_seg = from_itin["segments"][0]
+            if not return_ok(ret_seg["departure"]["at"]):
+                continue
 
         # --- Stop‑over filtering ----------------------------------------------
         if not stopovers_ok(to_itin, "departure") or not stopovers_ok(from_itin, "return"):
             continue
 
-        key = (dep_seg["departure"]["at"], ret_seg["departure"]["at"], price)
+        ret_seg = from_itin["segments"][0] if not ARGS.one_way else None
+        key = (dep_seg["departure"]["at"], ret_seg["departure"]["at"] if ret_seg else None, price)
         if key in seen:
             continue
         seen.add(key)
@@ -405,11 +434,12 @@ def display_offers(offers) -> None:
         duration_h, duration_m = iso_duration_to_hm(to_itin["duration"])
         dep_dt = datetime.fromisoformat(dep_seg["departure"]["at"])
         arr_dt = datetime.fromisoformat(to_itin["segments"][-1]["arrival"]["at"])
-        ret_dt = datetime.fromisoformat(ret_seg["departure"]["at"])
         num_stops = len(to_itin["segments"]) - 1
+
         print(f"{Fore.GREEN}£{price} | {duration_h}h{duration_m:02d}m | Stops {num_stops}")
         print(f"{Fore.YELLOW}From:  {dep_seg['departure']['iataCode']}  {dep_dt.isoformat()} ({dep_dt.strftime('%A')})")
         print(f"{Fore.CYAN}To:    {to_itin['segments'][-1]['arrival']['iataCode']}  {arr_dt.isoformat()} ({arr_dt.strftime('%A')})")
+
         if num_stops > 0:
             for i in range(1, len(to_itin["segments"])):
                 prev_arr = datetime.fromisoformat(to_itin["segments"][i - 1]["arrival"]["at"])
@@ -418,25 +448,25 @@ def display_offers(offers) -> None:
                 wait_hrs = (next_dep - prev_arr).total_seconds() / 3600
                 wait_fmt = f"{int(wait_hrs)}h {int((wait_hrs % 1) * 60)}m"
                 print(f"{Fore.LIGHTBLACK_EX}  ↪ Stopover at {stop} for {wait_fmt}")
-        # -- Return itinerary (pretty print)
-        ret_segs = from_itin["segments"]
-        ret_dep_seg = ret_segs[0]
-        ret_arr_seg = ret_segs[-1]
-        ret_dep_time = datetime.fromisoformat(ret_dep_seg["departure"]["at"])
-        ret_arr_time = datetime.fromisoformat(ret_arr_seg["arrival"]["at"])
 
-        print(f"{Fore.BLUE}Return:")
-        print(f"  From:  {ret_dep_seg['departure']['iataCode']}  {ret_dep_seg['departure']['at']} ({ret_dep_time.strftime('%A')})")
-        print(f"  To:    {ret_arr_seg['arrival']['iataCode']}  {ret_arr_seg['arrival']['at']} ({ret_arr_time.strftime('%A')})")
-
-        if len(ret_segs) > 1:
-            for i in range(1, len(ret_segs)):
-                prev_arr  = datetime.fromisoformat(ret_segs[i - 1]["arrival"]["at"])
-                next_dep  = datetime.fromisoformat(ret_segs[i]["departure"]["at"])
-                stop_code = ret_segs[i]["departure"]["iataCode"]
-                wait_hr   = (next_dep - prev_arr).total_seconds() / 3600
-                wait_fmt  = f"{int(wait_hr)}h {int((wait_hr % 1) * 60)}m"
-                print(f"{Fore.LIGHTBLACK_EX}  ↪ Stopover at {stop_code} for {wait_fmt}")
+        # Print Return
+        if not ARGS.one_way:
+            ret_segs = from_itin["segments"]
+            ret_dep_seg = ret_segs[0]
+            ret_arr_seg = ret_segs[-1]
+            ret_dep_time = datetime.fromisoformat(ret_dep_seg["departure"]["at"])
+            ret_arr_time = datetime.fromisoformat(ret_arr_seg["arrival"]["at"])
+            print(f"{Fore.BLUE}Return:")
+            print(f"  From:  {ret_dep_seg['departure']['iataCode']}  {ret_dep_seg['departure']['at']} ({ret_dep_time.strftime('%A')})")
+            print(f"  To:    {ret_arr_seg['arrival']['iataCode']}  {ret_arr_seg['arrival']['at']} ({ret_arr_time.strftime('%A')})")
+            if len(ret_segs) > 1:
+                for i in range(1, len(ret_segs)):
+                    prev_arr  = datetime.fromisoformat(ret_segs[i - 1]["arrival"]["at"])
+                    next_dep  = datetime.fromisoformat(ret_segs[i]["departure"]["at"])
+                    stop_code = ret_segs[i]["departure"]["iataCode"]
+                    wait_hr   = (next_dep - prev_arr).total_seconds() / 3600
+                    wait_fmt  = f"{int(wait_hr)}h {int((wait_hr % 1) * 60)}m"
+                    print(f"{Fore.LIGHTBLACK_EX}  ↪ Stopover at {stop_code} for {wait_fmt}")
 
         print(Style.RESET_ALL + "-"*60)
 
