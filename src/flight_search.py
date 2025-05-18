@@ -206,6 +206,8 @@ EXAMPLES
     p.add_argument("--nonstop", action="store_true")
     p.add_argument("--max-stops", type=int, default=1)
     p.add_argument("--max-results", type=int, default=5)
+    p.add_argument("--one-way", action="store_true", help="Skip return flight filtering and print only one-way itineraries")
+    p.add_argument("--allow-different-return-airport", action="store_true", help="Allow inbound to land at different airport")
     p.add_argument("--sort-by", nargs="+",
                    choices=["price", "duration", "departure_date", "return_date"],
                    help="Default: price departure_date duration return_date")
@@ -321,10 +323,10 @@ def run_search():
                 # Check if departure/return pass the day-time filters before making request
                 if not depart_ok(d_date + "T12:00:00"):
                     continue
-                if not return_ok(r_date + "T12:00:00"):
+                if not ARGS.one_way and not return_ok(r_date + "T12:00:00"):
                     continue
 
-                print(f"{Fore.BLUE}Checking {orig} → {dest} | {d_date} → {r_date}...{Style.RESET_ALL}")
+                print(f"{Fore.BLUE}Checking {orig} → {dest} | {d_date}" + (f" → {r_date}" if not ARGS.one_way else "") + f"...{Style.RESET_ALL}")
                 offers = call_amadeus(token, orig, dest, d_date, r_date)
                 if not offers:
                     continue
@@ -350,7 +352,8 @@ def call_amadeus(token: str, origin: str, destination: str,
         "originLocationCode":      origin,
         "destinationLocationCode": destination,
         "departureDate":           depart,
-        "returnDate":              ret,
+        # Optional returnDate
+        **({"returnDate": ret} if ret else {}),
         "adults":                  1,
         "max":                     ARGS.max_results,
         "currencyCode":            "GBP",
@@ -388,15 +391,41 @@ def display_offers(offers) -> None:
             continue
 
         # --- Inbound checks ----------------------------------------------------
-        ret_seg = from_itin["segments"][0]
-        if not return_ok(ret_seg["departure"]["at"]):
+        if not ARGS.one_way:
+            # -- Return itinerary (pretty print)
+            ret_segs = from_itin["segments"]
+            ret_dep_seg = ret_segs[0]
+            ret_arr_seg = ret_segs[-1]
+            if not ARGS.allow_different_return_airport:
+                to_arr = to_itin["segments"][-1]["arrival"]["iataCode"]
+                from_arr = ret_arr_seg["arrival"]["iataCode"]
+                if to_arr != from_arr:
+                    continue
+            ret_dep_time = datetime.fromisoformat(ret_dep_seg["departure"]["at"])
+            ret_arr_time = datetime.fromisoformat(ret_arr_seg["arrival"]["at"])
+            print(f"{Fore.BLUE}Return:")
+            print(f"  From:  {ret_dep_seg['departure']['iataCode']}  {ret_dep_seg['departure']['at']} ({ret_dep_time.strftime('%A')})")
+            print(f"  To:    {ret_arr_seg['arrival']['iataCode']}  {ret_arr_seg['arrival']['at']} ({ret_arr_time.strftime('%A')})")
+            if len(ret_segs) > 1:
+                for i in range(1, len(ret_segs)):
+                    prev_arr  = datetime.fromisoformat(ret_segs[i - 1]["arrival"]["at"])
+                    next_dep  = datetime.fromisoformat(ret_segs[i]["departure"]["at"])
+                    stop_code = ret_segs[i]["departure"]["iataCode"]
+                    wait_hr   = (next_dep - prev_arr).total_seconds() / 3600
+                    wait_fmt  = f"{int(wait_hr)}h {int((wait_hr % 1) * 60)}m"
+                    print(f"{Fore.LIGHTBLACK_EX}  ↪ Stopover at {stop_code} for {wait_fmt}")
+
+        if not ARGS.one_way:
+            ret_seg = from_itin["segments"][0]
+            if not return_ok(ret_seg["departure"]["at"]):
             continue
 
         # --- Stop‑over filtering ----------------------------------------------
         if not stopovers_ok(to_itin, "departure") or not stopovers_ok(from_itin, "return"):
             continue
 
-        key = (dep_seg["departure"]["at"], ret_seg["departure"]["at"], price)
+        ret_seg = from_itin["segments"][0] if not ARGS.one_way else None
+        key = (dep_seg["departure"]["at"], ret_seg["departure"]["at"] if ret_seg else None, price)
         if key in seen:
             continue
         seen.add(key)
